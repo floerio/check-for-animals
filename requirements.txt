@@ -21,6 +21,14 @@
 # Main model for species detection
 speciesnet
 
+# Optional: MegaDetector for improved animal detection (recommended)
+# Detects animals before species classification for better accuracy
+# Enable with --use-megadetector flag
+megadetector
+
+# Additional dependencies for image processing
+Pillow
+
 # Note: This script also requires ffmpeg to be installed on your system
 # Install ffmpeg via your system package manager:
 # - macOS: brew install ffmpeg

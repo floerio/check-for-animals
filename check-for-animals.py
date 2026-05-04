@@ -12,6 +12,18 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+try:
+    from megadetector.detection.run_detector_batch import load_and_run_detector_batch
+    MEGADETECTOR_AVAILABLE = True
+except ImportError:
+    MEGADETECTOR_AVAILABLE = False
+
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.mts', '.m4v'}
 FFMPEG_TIMEOUT = 600  # 10 minutes max per video extraction
 SPECIESNET_TIMEOUT = 1200  # 20 minutes max per speciesnet run
@@ -101,7 +113,133 @@ def extract_frames(video_path: Path, frames_dir: Path, every_n_seconds: float,
     return frames
 
 
-def run_speciesnet(image_dir: Path, output_json: Path, country: Optional[str], use_gpu: bool = False):
+def run_megadetector(frames_dir: Path, output_json: Path, detection_threshold: float = 0.2) -> Dict[str, Any]:
+    """Run MegaDetector on extracted frames to detect animals.
+
+    Returns:
+        Dict with detection results in MegaDetector JSON format
+    """
+    if not MEGADETECTOR_AVAILABLE:
+        raise RuntimeError("MegaDetector is not installed. Install with: pip install megadetector")
+
+    logger.debug(f"Running MegaDetector on {frames_dir} (threshold={detection_threshold})")
+
+    try:
+        # Run MegaDetector on all frames (convert Path objects to strings)
+        frame_files = [str(p) for p in sorted(frames_dir.glob('*.jpg'))]
+
+        if not frame_files:
+            logger.warning("No frames found for MegaDetector processing")
+            return {'images': []}
+
+        results = load_and_run_detector_batch(
+            model_file='MDV5A',
+            image_file_names=frame_files,
+            checkpoint_path=None,
+            confidence_threshold=detection_threshold,
+            checkpoint_frequency=-1,
+            quiet=True
+        )
+
+        # MegaDetector returns a list, wrap it in the expected format
+        if isinstance(results, list):
+            results_dict = {'images': results}
+        else:
+            results_dict = results
+
+        # Save results to JSON
+        with open(output_json, 'w') as f:
+            json.dump(results_dict, f, indent=2)
+
+        logger.debug(f"MegaDetector found {len(results_dict.get('images', []))} images with detections")
+        return results_dict
+
+    except Exception as e:
+        raise RuntimeError(f"MegaDetector failed: {e}") from e
+
+
+def crop_detections(frames_dir: Path, detections: Dict[str, Any], crops_dir: Path,
+                    min_confidence: float = 0.2, category_filter: Optional[List[str]] = None) -> List[Path]:
+    """Crop detected animals from frames based on MegaDetector bounding boxes.
+
+    Args:
+        frames_dir: Directory containing original frames
+        detections: MegaDetector results JSON
+        crops_dir: Output directory for cropped images
+        min_confidence: Minimum detection confidence (default: 0.2)
+        category_filter: List of categories to include (default: ['1'] for animals only)
+
+    Returns:
+        List of paths to cropped images
+    """
+    if not PIL_AVAILABLE:
+        raise RuntimeError("PIL (Pillow) is not installed. Install with: pip install Pillow")
+
+    if category_filter is None:
+        category_filter = ['1']  # Category 1 = animals in MegaDetector
+
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    crop_paths = []
+
+    for img_result in detections.get('images', []):
+        img_path = Path(img_result['file'])
+        img_detections = img_result.get('detections', [])
+
+        if not img_detections:
+            continue
+
+        # Load image
+        try:
+            img = Image.open(img_path)
+            img_width, img_height = img.size
+        except Exception as e:
+            logger.warning(f"Failed to load image {img_path}: {e}")
+            continue
+
+        # Crop each detection
+        for i, det in enumerate(img_detections):
+            confidence = det.get('conf', 0.0)
+            category = str(det.get('category', ''))
+
+            # Filter by confidence and category
+            if confidence < min_confidence or category not in category_filter:
+                continue
+
+            # MegaDetector bbox format: [x_min, y_min, width, height] in normalized coordinates
+            bbox = det.get('bbox', [])
+            if len(bbox) != 4:
+                continue
+
+            x_min, y_min, width, height = bbox
+
+            # Convert to absolute pixel coordinates
+            left = int(x_min * img_width)
+            top = int(y_min * img_height)
+            right = int((x_min + width) * img_width)
+            bottom = int((y_min + height) * img_height)
+
+            # Ensure coordinates are within image bounds
+            left = max(0, min(left, img_width))
+            right = max(0, min(right, img_width))
+            top = max(0, min(top, img_height))
+            bottom = max(0, min(bottom, img_height))
+
+            # Skip if bbox is invalid
+            if right <= left or bottom <= top:
+                continue
+
+            # Crop and save
+            crop = img.crop((left, top, right, bottom))
+            crop_filename = f"{img_path.stem}_crop{i:03d}_conf{int(confidence*100):02d}.jpg"
+            crop_path = crops_dir / crop_filename
+            crop.save(crop_path, quality=95)
+            crop_paths.append(crop_path)
+
+    logger.debug(f"Extracted {len(crop_paths)} animal crops from {len(detections.get('images', []))} frames")
+    return crop_paths
+
+
+def run_speciesnet(image_dir: Path, output_json: Path, country: Optional[str]):
     """Run speciesnet model on extracted frames."""
     cmd = [
         sys.executable,
@@ -111,10 +249,8 @@ def run_speciesnet(image_dir: Path, output_json: Path, country: Optional[str], u
     ]
     if country:
         cmd.extend(['--country', country])
-    if use_gpu:
-        cmd.append('--use_gpu')
 
-    logger.debug(f"Running speciesnet on {image_dir}{' (GPU)' if use_gpu else ' (CPU)'}")
+    logger.debug(f"Running speciesnet on {image_dir}")
     try:
         subprocess.run(
             cmd,
@@ -143,64 +279,29 @@ def load_predictions(predictions_json: Path) -> Dict[str, Any]:
         raise RuntimeError(f"Invalid JSON in {predictions_json}: {e}") from e
 
 
-def _extract_classification_label(classifications: Any) -> Optional[Tuple[str, float]]:
-    """Extract label and confidence from classification data."""
-    if not isinstance(classifications, list) or not classifications:
-        return None
+def _parse_species_from_prediction(prediction_str: str) -> str:
+    """Extract species name from SpeciesNet prediction string.
 
-    first = classifications[0]
+    Format: "uuid;kingdom;order;family;genus;species;common name"
+    Example: "eb3829b0-772e-4088-ae90-f11b9fe38284;mammalia;artiodactyla;cervidae;cervus;elaphus;red deer"
+    """
+    if not prediction_str or not isinstance(prediction_str, str):
+        return 'no_confident_prediction'
 
-    # Handle list format: [label, confidence]
-    if isinstance(first, list) and len(first) >= 2:
-        try:
-            return str(first[0]), float(first[1] or 0.0)
-        except (ValueError, TypeError):
-            return None
+    parts = prediction_str.split(';')
+    if len(parts) >= 7:
+        # Last part is the common name
+        common_name = parts[-1].strip()
+        if common_name and common_name.lower() not in ('blank', 'animal', 'person', 'vehicle'):
+            return common_name
 
-    # Handle dict format
-    if isinstance(first, dict):
-        label = first.get('label') or first.get('class_name') or first.get('name')
-        conf = first.get('conf', first.get('score', 0.0))
-        if label:
-            try:
-                return str(label), float(conf or 0.0)
-            except (ValueError, TypeError):
-                return None
+    # Fallback to the last non-empty part
+    for part in reversed(parts):
+        part = part.strip()
+        if part and part.lower() not in ('', 'blank'):
+            return part
 
-    return None
-
-
-def _get_best_detection(detections: List[Dict[str, Any]], confidence_threshold: float) -> Tuple[Optional[str], float]:
-    """Find the best species detection from a list of detections."""
-    best_label = None
-    best_conf = 0.0
-
-    for det in detections:
-        try:
-            conf = float(det.get('conf', 0.0) or 0.0)
-        except (ValueError, TypeError):
-            continue
-
-        if conf < confidence_threshold:
-            continue
-
-        # Try to extract classification
-        classifications = det.get('classifications') or det.get('classification') or []
-        result = _extract_classification_label(classifications)
-
-        if result:
-            label, class_conf = result
-            if class_conf > best_conf:
-                best_conf = class_conf
-                best_label = label
-        # Fallback to generic animal detection
-        elif best_label is None:
-            category = det.get('category')
-            if category in ('1', 1):
-                best_label = 'animal_unspecified'
-                best_conf = conf
-
-    return best_label, best_conf
+    return 'no_confident_prediction'
 
 
 def summarize_predictions(predictions: Dict[str, Any], confidence_threshold: float) -> Tuple[List[Dict[str, Any]], List[Tuple[str, int]]]:
@@ -212,18 +313,30 @@ def summarize_predictions(predictions: Dict[str, Any], confidence_threshold: flo
 
     for item in image_entries:
         file_name = item.get('filepath', item.get('file', ''))
-        detections = item.get('detections', [])
 
-        best_label, best_conf = _get_best_detection(detections, confidence_threshold)
+        # Get the ensemble prediction and score from SpeciesNet
+        prediction_str = item.get('prediction', '')
+        prediction_score = item.get('prediction_score', 0.0)
+
+        try:
+            confidence = float(prediction_score or 0.0)
+        except (ValueError, TypeError):
+            confidence = 0.0
+
+        # Parse species name from prediction string
+        if confidence >= confidence_threshold:
+            species_label = _parse_species_from_prediction(prediction_str)
+        else:
+            species_label = 'no_confident_prediction'
 
         per_frame.append({
             'frame': file_name,
-            'best_label': best_label or 'no_confident_prediction',
-            'confidence': round(best_conf, 4),
+            'best_label': species_label,
+            'confidence': round(confidence, 4),
         })
 
-        if best_label and best_label != 'no_confident_prediction':
-            species_counter[best_label] += 1
+        if species_label and species_label != 'no_confident_prediction':
+            species_counter[species_label] += 1
 
     top_species = species_counter.most_common(5)
     return per_frame, top_species
@@ -232,9 +345,14 @@ def summarize_predictions(predictions: Dict[str, Any], confidence_threshold: flo
 def process_video(video_path: Path, done_dir: Path, results_dir: Path, frame_interval: float,
                   confidence_threshold: float, country: Optional[str], frame_quality: int = 2,
                   resize_width: Optional[int] = None, hwaccel: Optional[str] = None,
-                  use_gpu: bool = False) -> Dict[str, Any]:
-    """Process a single video: extract frames, run speciesnet, summarize results."""
-    logger.info(f"Processing: {video_path.name}")
+                  use_megadetector: bool = False, megadetector_threshold: float = 0.2) -> Dict[str, Any]:
+    """Process a single video: extract frames, run speciesnet, summarize results.
+
+    Args:
+        use_megadetector: If True, use MegaDetector to detect animals before SpeciesNet classification
+        megadetector_threshold: Minimum confidence for MegaDetector detections
+    """
+    logger.info(f"Processing: {video_path.name}{' (with MegaDetector)' if use_megadetector else ''}")
     stem = sanitize_name(video_path.stem)
     video_result_dir = results_dir / stem
     video_result_dir.mkdir(parents=True, exist_ok=True)
@@ -252,9 +370,34 @@ def process_video(video_path: Path, done_dir: Path, results_dir: Path, frame_int
             logger.debug(f"Removing old predictions file: {predictions_json}")
             predictions_json.unlink()
 
-        run_speciesnet(frames_dir, predictions_json, country, use_gpu)
-        predictions = load_predictions(predictions_json)
-        per_frame, top_species = summarize_predictions(predictions, confidence_threshold)
+        # Choose workflow: MegaDetector + SpeciesNet OR SpeciesNet only
+        if use_megadetector:
+            # Step 1: Run MegaDetector to detect animals
+            megadetector_json = video_result_dir / f'{stem}_megadetector.json'
+            detections = run_megadetector(frames_dir, megadetector_json, megadetector_threshold)
+
+            # Step 2: Crop detected animals
+            crops_dir = Path(tmpdir) / 'crops'
+            crop_paths = crop_detections(frames_dir, detections, crops_dir,
+                                        min_confidence=megadetector_threshold,
+                                        category_filter=['1'])  # Only animals
+
+            if not crop_paths:
+                logger.warning(f"No animals detected by MegaDetector in {video_path.name}")
+                # Return empty results
+                per_frame = []
+                top_species = []
+            else:
+                # Step 3: Run SpeciesNet on cropped animals
+                logger.debug(f"Running SpeciesNet on {len(crop_paths)} animal crops")
+                run_speciesnet(crops_dir, predictions_json, country)
+                predictions = load_predictions(predictions_json)
+                per_frame, top_species = summarize_predictions(predictions, confidence_threshold)
+        else:
+            # Original workflow: SpeciesNet on full frames
+            run_speciesnet(frames_dir, predictions_json, country)
+            predictions = load_predictions(predictions_json)
+            per_frame, top_species = summarize_predictions(predictions, confidence_threshold)
 
     done_dir.mkdir(parents=True, exist_ok=True)
     destination = done_dir / video_path.name
@@ -287,9 +430,11 @@ def validate_args(args):
         raise ValueError('--frame-quality must be between 2 (best) and 31 (worst)')
     if args.resize_width is not None and args.resize_width < 100:
         raise ValueError('--resize-width must be at least 100 pixels')
+    if not 0 <= args.megadetector_threshold <= 1:
+        raise ValueError('--megadetector-threshold must be between 0 and 1')
 
 
-def process_video_wrapper(args_tuple: Tuple[Path, Path, Path, float, float, Optional[str], int, Optional[int], Optional[str], bool]) -> Dict[str, Any]:
+def process_video_wrapper(args_tuple: Tuple[Path, Path, Path, float, float, Optional[str], int, Optional[int], Optional[str], bool, float]) -> Dict[str, Any]:
     """Wrapper for process_video to enable parallel processing."""
     try:
         return process_video(*args_tuple)
@@ -342,8 +487,10 @@ def main():
                            help='Resize frames to this width (maintains aspect ratio). Smaller = faster inference.')
     perf_group.add_argument('--hwaccel', choices=['videotoolbox', 'cuda'], default=None,
                            help='Hardware acceleration for ffmpeg. Use "videotoolbox" on macOS or "cuda" for NVIDIA GPU.')
-    perf_group.add_argument('--gpu', action='store_true',
-                           help='Use GPU for SpeciesNet inference (requires CUDA-compatible GPU and proper setup).')
+    perf_group.add_argument('--use-megadetector', action='store_true',
+                           help='Use MegaDetector to detect animals before species classification. Improves accuracy but requires additional dependencies.')
+    perf_group.add_argument('--megadetector-threshold', type=float, default=0.2,
+                           help='Minimum confidence threshold for MegaDetector animal detections (0-1).')
     args = parser.parse_args()
 
     setup_logging(args.verbose)
@@ -357,6 +504,16 @@ def main():
     if not check_ffmpeg():
         logger.error('ffmpeg is required but was not found in PATH.')
         raise SystemExit(1)
+
+    # Check MegaDetector availability if requested
+    if args.use_megadetector:
+        if not MEGADETECTOR_AVAILABLE:
+            logger.error('MegaDetector is not installed. Install with: pip install megadetector')
+            raise SystemExit(1)
+        if not PIL_AVAILABLE:
+            logger.error('Pillow is not installed. Install with: pip install Pillow')
+            raise SystemExit(1)
+        logger.info('MegaDetector mode enabled - will detect animals before classification')
 
     input_dir = Path(args.input_dir)
     done_dir = Path(args.done_dir)
@@ -380,7 +537,8 @@ def main():
     # Prepare arguments for each video
     video_args = [
         (video_path, done_dir, results_dir, args.frame_interval, args.confidence_threshold,
-         args.country, args.frame_quality, args.resize_width, args.hwaccel, args.gpu)
+         args.country, args.frame_quality, args.resize_width, args.hwaccel,
+         args.use_megadetector, args.megadetector_threshold)
         for video_path in videos
     ]
 

@@ -4,7 +4,17 @@ This guide explains how to speed up video processing using the available optimiz
 
 ## Quick Start: Recommended Fast Settings
 
-For **macOS** (best balance of speed and accuracy):
+**Best Accuracy** (with MegaDetector - recommended for wildlife monitoring):
+```bash
+python3 check-for-animals.py \
+  --use-megadetector \
+  --frame-interval 5.0 \
+  --resize-width 640 \
+  --hwaccel videotoolbox \
+  --max-workers 2
+```
+
+**Best Speed** (macOS, without MegaDetector):
 ```bash
 python3 check-for-animals.py \
   --frame-interval 5.0 \
@@ -14,16 +24,76 @@ python3 check-for-animals.py \
   --max-workers 2
 ```
 
-For **Linux/Windows with NVIDIA GPU** (fastest):
+**Linux/Windows with NVIDIA GPU**:
 ```bash
 python3 check-for-animals.py \
+  --use-megadetector \
   --frame-interval 5.0 \
   --resize-width 640 \
   --hwaccel cuda \
-  --gpu \
-  --frame-quality 5 \
   --max-workers 2
 ```
+
+**Note:** SpeciesNet automatically uses GPU acceleration (M1/M2 Mac via MPS, NVIDIA via CUDA) if PyTorch detects compatible hardware. No additional flags needed.
+
+## MegaDetector Integration (Recommended for Better Accuracy)
+
+**MegaDetector** is Microsoft's wildlife detection model that can significantly improve detection accuracy. When enabled, the workflow changes from:
+
+```
+Video → Frames → SpeciesNet → Species predictions
+```
+
+to:
+
+```
+Video → Frames → MegaDetector (detect animals) → Crop animals → SpeciesNet (classify) → Species predictions
+```
+
+### When to Use MegaDetector:
+
+✅ **Use MegaDetector if you experience:**
+- Animals present but not detected
+- Wrong species classifications
+- Need for higher accuracy in challenging conditions (camouflage, distant animals, low light)
+
+❌ **Skip MegaDetector if:**
+- Processing speed is critical and accuracy is acceptable
+- You have simple, clear camera trap images with obvious animals
+
+### Enabling MegaDetector:
+
+First, install the additional dependencies:
+```bash
+pip install megadetector Pillow
+```
+
+Then add the `--use-megadetector` flag:
+```bash
+python3 check-for-animals.py \
+  --use-megadetector \
+  --frame-interval 5.0 \
+  --resize-width 640 \
+  --max-workers 2
+```
+
+### MegaDetector Options:
+
+- `--use-megadetector`: Enable MegaDetector workflow
+- `--megadetector-threshold`: Minimum confidence for detections (default: 0.2, range: 0-1)
+
+**Example with custom threshold:**
+```bash
+python3 check-for-animals.py \
+  --use-megadetector \
+  --megadetector-threshold 0.3 \  # More conservative, fewer false positives
+  --frame-interval 5.0
+```
+
+**Trade-offs:**
+- ⚡ **Speed**: ~20-30% slower (running two models instead of one)
+- ✅ **Accuracy**: Significantly better detection and classification
+- 📊 **Best for**: Camera trap workflows, wildlife monitoring
 
 ## Optimization Options Explained
 
@@ -58,15 +128,14 @@ Accelerate frame extraction from videos:
 
 **Tradeoff:** Minimal, usually just faster with no quality loss.
 
-### 4. GPU for SpeciesNet (Huge Impact if available)
-**Flag:** `--gpu`  
-**Default:** CPU-only
+### 4. GPU Acceleration (Automatic - Huge Impact if available)
 
-Use GPU for species detection (10-100x faster inference):
-- Requires NVIDIA GPU with CUDA support
-- Requires proper PyTorch/CUDA installation
+SpeciesNet **automatically** uses GPU acceleration when available:
+- **M1/M2/M3 Mac:** Uses MPS (Metal Performance Shaders) automatically
+- **NVIDIA GPU:** Uses CUDA automatically if drivers are installed
+- No manual flags required - just ensure PyTorch is installed correctly
 
-**Tradeoff:** None if you have compatible hardware.
+**Performance impact:** 10-100x faster inference on compatible hardware.
 
 ### 5. Frame Quality (Minor Impact)
 **Flag:** `--frame-quality <2-31>`  
@@ -104,21 +173,26 @@ Example processing times for a 10-minute 1080p video:
 
 *Times are approximate and depend on hardware*
 
-## GPU Setup (Optional but Recommended)
+## Verifying GPU Acceleration
 
-### Check if you have NVIDIA GPU:
+### For M1/M2/M3 Mac:
+Check if MPS (Metal Performance Shaders) is available:
 ```bash
-nvidia-smi  # Should show GPU info if available
+python3 -c "import torch; print('MPS available:', torch.backends.mps.is_available())"
 ```
 
-### Install PyTorch with CUDA support:
+If it shows `True`, SpeciesNet will automatically use your Mac's GPU. No additional setup needed!
+
+### For NVIDIA GPU (Linux/Windows):
+Check if CUDA is available:
+```bash
+nvidia-smi  # Should show GPU info
+python3 -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+```
+
+If CUDA is not available but you have an NVIDIA GPU, install PyTorch with CUDA support:
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-```
-
-### Verify GPU is available:
-```bash
-python3 -c "import torch; print('CUDA available:', torch.cuda.is_available())"
 ```
 
 ## Monitoring Performance
@@ -144,14 +218,14 @@ Start conservative and increase aggressiveness:
 
 **Level 3 - Aggressive (10-20x faster):**
 ```bash
---frame-interval 10.0 --resize-width 480 --hwaccel videotoolbox --frame-quality 8 --gpu --max-workers 4
+--frame-interval 10.0 --resize-width 480 --hwaccel videotoolbox --frame-quality 8 --max-workers 4
 ```
 
 ## Troubleshooting
 
 **"hwaccel not supported"**: Your ffmpeg may not have hardware acceleration compiled in. Remove `--hwaccel`.
 
-**"CUDA not available"**: GPU flag won't work. Install CUDA-enabled PyTorch or remove `--gpu`.
+**Slow inference on M1/M2 Mac**: Check if MPS is available (see "Verifying GPU Acceleration" above). PyTorch should use your Mac's GPU automatically.
 
 **System slowdown**: Reduce `--max-workers` to prevent overloading your system.
 
