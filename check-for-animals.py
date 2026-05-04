@@ -5,7 +5,6 @@ import logging
 import shutil
 import subprocess
 import sys
-import tempfile
 import traceback
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -357,47 +356,49 @@ def process_video(video_path: Path, done_dir: Path, results_dir: Path, frame_int
     video_result_dir = results_dir / stem
     video_result_dir.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix=f'{stem}_frames_') as tmpdir:
-        frames_dir = Path(tmpdir)
-        frames = extract_frames(video_path, frames_dir, frame_interval, frame_quality, resize_width, hwaccel)
-        if not frames:
-            raise RuntimeError('No frames were extracted from the video.')
+    # Create permanent frames directory within results
+    frames_dir = video_result_dir / 'frames'
+    frames_dir.mkdir(parents=True, exist_ok=True)
 
-        predictions_json = video_result_dir / f'{stem}_predictions.json'
+    frames = extract_frames(video_path, frames_dir, frame_interval, frame_quality, resize_width, hwaccel)
+    if not frames:
+        raise RuntimeError('No frames were extracted from the video.')
 
-        # Remove old predictions file to prevent SpeciesNet from trying to resume with mismatched paths
-        if predictions_json.exists():
-            logger.debug(f"Removing old predictions file: {predictions_json}")
-            predictions_json.unlink()
+    predictions_json = video_result_dir / f'{stem}_predictions.json'
 
-        # Choose workflow: MegaDetector + SpeciesNet OR SpeciesNet only
-        if use_megadetector:
-            # Step 1: Run MegaDetector to detect animals
-            megadetector_json = video_result_dir / f'{stem}_megadetector.json'
-            detections = run_megadetector(frames_dir, megadetector_json, megadetector_threshold)
+    # Remove old predictions file to prevent SpeciesNet from trying to resume with mismatched paths
+    if predictions_json.exists():
+        logger.debug(f"Removing old predictions file: {predictions_json}")
+        predictions_json.unlink()
 
-            # Step 2: Crop detected animals
-            crops_dir = Path(tmpdir) / 'crops'
-            crop_paths = crop_detections(frames_dir, detections, crops_dir,
-                                        min_confidence=megadetector_threshold,
-                                        category_filter=['1'])  # Only animals
+    # Choose workflow: MegaDetector + SpeciesNet OR SpeciesNet only
+    if use_megadetector:
+        # Step 1: Run MegaDetector to detect animals
+        megadetector_json = video_result_dir / f'{stem}_megadetector.json'
+        detections = run_megadetector(frames_dir, megadetector_json, megadetector_threshold)
 
-            if not crop_paths:
-                logger.warning(f"No animals detected by MegaDetector in {video_path.name}")
-                # Return empty results
-                per_frame = []
-                top_species = []
-            else:
-                # Step 3: Run SpeciesNet on cropped animals
-                logger.debug(f"Running SpeciesNet on {len(crop_paths)} animal crops")
-                run_speciesnet(crops_dir, predictions_json, country)
-                predictions = load_predictions(predictions_json)
-                per_frame, top_species = summarize_predictions(predictions, confidence_threshold)
+        # Step 2: Crop detected animals
+        crops_dir = video_result_dir / 'crops'
+        crop_paths = crop_detections(frames_dir, detections, crops_dir,
+                                    min_confidence=megadetector_threshold,
+                                    category_filter=['1'])  # Only animals
+
+        if not crop_paths:
+            logger.warning(f"No animals detected by MegaDetector in {video_path.name}")
+            # Return empty results
+            per_frame = []
+            top_species = []
         else:
-            # Original workflow: SpeciesNet on full frames
-            run_speciesnet(frames_dir, predictions_json, country)
+            # Step 3: Run SpeciesNet on cropped animals
+            logger.debug(f"Running SpeciesNet on {len(crop_paths)} animal crops")
+            run_speciesnet(crops_dir, predictions_json, country)
             predictions = load_predictions(predictions_json)
             per_frame, top_species = summarize_predictions(predictions, confidence_threshold)
+    else:
+        # Original workflow: SpeciesNet on full frames
+        run_speciesnet(frames_dir, predictions_json, country)
+        predictions = load_predictions(predictions_json)
+        per_frame, top_species = summarize_predictions(predictions, confidence_threshold)
 
     done_dir.mkdir(parents=True, exist_ok=True)
     destination = done_dir / video_path.name
