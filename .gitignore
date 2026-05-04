@@ -3,3 +3,6 @@
 /input
 /results
 /venv
+/save
+/__pycache__
+

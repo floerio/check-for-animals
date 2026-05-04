@@ -1,0 +1,28 @@
+# Wildlife video processing dependencies
+#
+# PYTHON VERSION REQUIREMENT: 3.9 - 3.12
+# speciesnet does not support Python 3.13+
+#
+# Setup with pyenv (recommended):
+#   brew install pyenv
+#
+#   # Add to ~/.zshrc (one time setup):
+#   echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.zshrc
+#   echo 'export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.zshrc
+#   echo 'eval "$(pyenv init -)"' >> ~/.zshrc
+#   source ~/.zshrc
+#
+#   pyenv install 3.12.0
+#   pyenv local 3.12.0
+#   python3 -m venv venv
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+
+# Main model for species detection
+speciesnet
+
+# Note: This script also requires ffmpeg to be installed on your system
+# Install ffmpeg via your system package manager:
+# - macOS: brew install ffmpeg
+# - Ubuntu/Debian: apt-get install ffmpeg
+# - Windows: Download from https://ffmpeg.org/download.html
