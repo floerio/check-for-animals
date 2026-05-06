@@ -484,7 +484,7 @@ def main():
     perf_group = parser.add_argument_group('performance optimization')
     perf_group.add_argument('--frame-quality', type=int, default=2,
                            help='JPEG quality for extracted frames (2=best, 31=worst). Higher values = lower quality but faster.')
-    perf_group.add_argument('--resize-width', type=int, default=None,
+    perf_group.add_argument('--resize-width', type=int, default=1024,
                            help='Resize frames to this width (maintains aspect ratio). Smaller = faster inference.')
     perf_group.add_argument('--hwaccel', choices=['videotoolbox', 'cuda'], default=None,
                            help='Hardware acceleration for ffmpeg. Use "videotoolbox" on macOS or "cuda" for NVIDIA GPU.')
